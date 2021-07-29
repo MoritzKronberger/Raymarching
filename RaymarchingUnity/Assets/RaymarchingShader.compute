@@ -1,0 +1,371 @@
+// unity specific setup as in https://github.com/SebLague/Ray-Marching
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it with cs.SetTexture
+RWTexture2D<float4> Result;
+
+// import scene parameters
+float2 Resolution;
+float4x4 CameraCoord_to_WorldCoord;
+float4x4 Inverse_Camera_Projection_Matrix;
+float3 backgroundColor;
+float ambientLightIntensity;
+
+// set fixed parameters
+static const float maxDistance = 80;
+static const float epsilon = 0.01;
+static const int maxSteps = 150;
+
+// import scene primitives
+struct Prim{
+    int primType;
+    int combinationMode;
+    float smoothAmount;
+    float3 color;
+    float diffuse;
+    float specular;
+    int specularHardness;
+    float3 position;
+    float3 size;
+    float3 rotation;
+};
+
+StructuredBuffer<Prim> prims;
+int primCount;
+
+// import scene lights
+struct Light{
+    float3 position;
+    float3 brightness;
+};
+
+StructuredBuffer<Light> lights;
+int lightCount;
+
+// create Ray object
+struct Ray{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction){
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+
+    return ray;
+}
+
+// create Ray from Camera based on uv coordinates
+Ray CreateCameraRay(float2 uv){
+    // set ray origin by translating camera origin to world coordinates
+    float3 origin = mul(CameraCoord_to_WorldCoord, float4(0,0,0,1)).xyz;
+    // set ray direction from camera origin to uv coordinate
+    float3 direction = mul(Inverse_Camera_Projection_Matrix, float4(uv,0,1)).xyz;
+    // translate ray direction to world coordinates
+    direction = mul(CameraCoord_to_WorldCoord, float4(direction,0)).xyz;
+    // normalize direction vector
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+float maxcomp(float3 v){
+    return max(max(v.x, v.y), v.z);
+}
+
+float3 rotateAndTranslate(float3 v, float3 rot, float3 trans){
+    rot = radians(rot);
+    float alpha = rot.x;
+    float beta  = rot.y;
+    float gamma = rot.z;
+
+    float4x4 rotation = {cos(beta)*cos(gamma),  cos(alpha)*sin(gamma)+sin(alpha)*sin(beta)*cos(gamma), sin(alpha)*sin(gamma)-cos(alpha)*sin(beta)*cos(gamma), 0,
+                         -cos(beta)*sin(gamma), cos(alpha)*cos(gamma)-sin(alpha)*sin(beta)*sin(gamma), sin(alpha)*cos(gamma)+cos(alpha)*sin(beta)*sin(gamma), 0,
+                         sin(beta),             -sin(alpha)*cos(beta),                                 cos(alpha)*cos(beta),                                  0,
+                         0,                     0,                                                     0,                                                     1 };
+
+    float4x4 translation = {1, 0, 0, -trans.x,
+                            0, 1, 0, -trans.y,
+                            0, 0, 1, -trans.z,
+                            0, 0, 0,  1       };
+
+    float4 v4 = float4(v, 1);
+    float4 v_new = mul(rotation,mul(translation,v4));
+    return float3 (v_new.x/v_new.w, v_new.y/v_new.w, v_new.z/v_new.w);
+}
+
+// SDF for sphere
+float GetDistanceSphere(Prim prim, float3 p){
+    return distance(p, prim.position)-prim.size.x;
+}
+
+// SDF for box from https://iquilezles.org/www/articles/distfunctions/distfunctions.htm
+float GetDistanceBox(Prim box, float3 p){
+    float3 q = abs(p)-box.size;
+    float n = min(maxcomp(q),0);
+    return length(max(q,0))+n;
+}
+
+// SDF for torus from https://iquilezles.org/www/articles/distfunctions/distfunctions.htm
+float GetDistanceTorus(Prim torus, float3 p){
+    float2 q = float2(length(p.xz)-torus.size.x,p.y);
+    return length(q)-torus.size.y;
+}
+
+// call matching SDF for Primitive
+float GetDistance(Prim prim, float3 p){
+    if(prim.primType == 0){
+        return GetDistanceSphere(prim, p);
+    }
+    if(prim.primType == 1){
+        return p.y;
+    }
+    if(prim.primType == 2){
+        float3 p_t = rotateAndTranslate(p, prim.rotation, prim.position);
+        return GetDistanceBox(prim, p_t);
+    }
+    if(prim.primType == 3){
+        float3 p_t = rotateAndTranslate(p, prim.rotation, prim.position);
+        return GetDistanceTorus(prim, p_t);
+    }
+
+    // return maxDistance if no Primitive is found
+    return maxDistance;
+}
+
+// cubic smooth min function:
+// from: https://iquilezles.org/www/articles/smin/smin.htm
+float2 cubicSmoothMin(float dstA, float dstB, float k){
+    float h = max((k-abs(dstA-dstB)),0)/k;
+    float m = h*h*0.5;
+    return float2(min(dstA, dstB) - (k/6)*h*h*h, m);
+}
+
+// gets minimum distance from point to all primitives with respect to combination mode
+// provides material information in second matrix row
+float2x4 minDst(float3 p){
+
+    // Set Distance and Color if no Primitives can be found
+    float minDistance = maxDistance;
+    float3 pointColor = 1;
+    float pointDiffuse = 1;
+    float pointSpecular = 0;
+    float pointSpecH = 1;
+
+    // Evaluate for all Primitives in Scene
+    for(int i = 0; i<primCount; i++){
+        Prim prim = prims[i];
+
+        float primDistance = GetDistance(prim, p);
+        float3 primColor = prim.color;
+        float primDiffuse = prim.diffuse;
+        float primSpecular = prim.specular;
+        float primSpecH = prim.specularHardness;
+
+        if (prim.smoothAmount>0){
+            float2 smooth = cubicSmoothMin(minDistance, primDistance, prim.smoothAmount);
+            if(minDistance > primDistance){
+                pointColor    = lerp(pointColor, primColor, 1-smooth.y); 
+                pointDiffuse  = lerp(pointDiffuse, primDiffuse, 1-smooth.y);
+                pointSpecular = lerp(pointSpecular, primSpecular, 1-smooth.y);
+                pointSpecH    = lerp(pointSpecH, primSpecH, 1-smooth.y);
+            }else{
+                pointColor    = lerp(pointColor, primColor, smooth.y);
+                pointDiffuse  = lerp(pointDiffuse, primDiffuse, smooth.y);
+                pointSpecular = lerp(pointSpecular, primSpecular, smooth.y);
+                pointSpecH    = lerp(pointSpecH, primSpecH, smooth.y);
+            }
+            minDistance = smooth.x;
+        } 
+        // Subtract
+        else if(prim.combinationMode==1){
+            if(minDistance < -primDistance){
+                minDistance = -primDistance;
+            }
+        }
+        // Intersect
+        else if(prim.combinationMode==2){
+            if(minDistance < primDistance){
+                minDistance = primDistance;
+            }
+        }
+        // Union
+        else{
+            if(minDistance > primDistance){
+                minDistance = primDistance;
+                pointColor = primColor;
+                pointDiffuse = primDiffuse;
+                pointSpecular = primSpecular;
+                pointSpecH = primSpecH;
+            }
+        }
+    }
+
+    // return minimum distance and material info
+    return float2x4(pointColor, minDistance, pointDiffuse, pointSpecular, pointSpecH, 0);
+}
+
+float3 approximateNormal(float3 p){
+    return normalize(float3(
+        (minDst(float3(p.x + epsilon, p.y, p.z))[0][3] - minDst(float3(p.x - epsilon, p.y, p.z))[0][3]),
+        (minDst(float3(p.x, p.y + epsilon, p.z))[0][3] - minDst(float3(p.x, p.y - epsilon, p.z))[0][3]),
+        (minDst(float3(p.x, p.y, p.z + epsilon))[0][3] - minDst(float3(p.x, p.y, p.z - epsilon))[0][3])
+    ));
+}
+
+
+float basicShadow(float3 p, float3 pNormal, float3 lightPos){
+    // create new Ray from Light to Point
+    float3 direction = p - lightPos;
+    direction = normalize(direction);
+    float distanceToLight = distance(p, lightPos);
+
+    Ray shadowRay = CreateRay(lightPos, direction);
+
+    float globalDistance = 0;
+    int maxSteps = 50;
+    int steps = 0;
+
+    while(globalDistance + epsilon*50 < distanceToLight && steps < maxSteps){
+
+        float4 evalSceneForPoint = minDst(shadowRay.origin)[0];
+
+        float dist = evalSceneForPoint.w;
+        steps ++;
+
+        // check if collision occured
+        if(dist < epsilon){
+            return 0;
+        }
+
+        // update new point position
+        shadowRay.origin += shadowRay.direction * dist;
+        // update current distance
+        globalDistance += dist;
+    }
+    return 1;
+}
+
+float softShadow(float3 p, float3 pNormal, float3 lightPos, float k){
+    // create new Ray from Light to Point
+    float3 direction = p - lightPos;
+    direction = normalize(direction);
+    float distanceToLight = distance(p, lightPos);
+
+    Ray shadowRay = CreateRay(lightPos, direction);
+
+    float globalDistance = 0;
+    float shadow = 1;
+    int maxSteps = 50;
+    int steps = 0;
+
+    while(globalDistance + epsilon*5  < distanceToLight && steps < maxSteps){
+
+        float4 evalSceneForPoint = minDst(shadowRay.origin)[0];
+
+        float dist = evalSceneForPoint.w;
+        steps++;
+
+        // get distance between Point to shade and current ray-end
+        float dstObjP = distanceToLight - globalDistance;
+
+        // get shadow intensity
+        shadow = min(shadow, k * dist/dstObjP);
+
+        // update new point position
+        shadowRay.origin += shadowRay.direction * dist;
+        // update current distance
+        globalDistance += dist;
+    }
+    return shadow;
+}
+
+float3 diffAndSpec(float3 p, float3 pNormal, float3 pColor, float3 lightPos, float distanceToLight, float3 brightness, float diffuse, float specular, float power){
+    
+    float kd = diffuse;
+    float ks = specular;
+
+    // falloff light intensity
+    float3 lIn = brightness / pow(distanceToLight,2);
+    // vector from Point to Lighsource (normalized)
+    float3 l = lightPos - p;
+    l = normalize(l);
+    // vector from Point to Camera (normalized)
+    float3 v = mul(CameraCoord_to_WorldCoord, float4(0,0,0,1)).xyz - p;
+    v = normalize(v);
+
+    // halfway Vektor
+    float3 h =normalize(l+v);
+
+    // Blinn-Phong model for diff and spec
+    float3 lightDiffuse  = lIn * kd * pColor * max(dot(l,pNormal),0);
+    float3 lightSpecular = lIn * ks          * (pow(max(dot(h, pNormal),0), power));
+
+    return  lightDiffuse + lightSpecular;
+}
+
+float3 phongLight(float3 p, float3 pNormal, float3 pColor, float diffuse, float specular, float power){
+    float3 pointLight = 0;
+    // add diff and spec and shadow of all lights
+    for(int i = 0; i<lightCount; i++){
+        Light light = lights[i];
+        float distanceToLight = distance(p, light.position);
+        float3 diffSpec = diffAndSpec(p, pNormal, pColor, light.position, distanceToLight, light.brightness, diffuse, specular, power);
+        float sShadow = softShadow(p, pNormal, light.position, 3);
+        // float sShadow = basicShadow(p, pNormal, light.position);
+        pointLight += diffSpec * sShadow;
+    }
+    pointLight += pColor * ambientLightIntensity;
+    return pointLight;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID){
+    
+    // track global distance and steps marched
+    float globalDistance = 0;
+    int steps = 0;
+
+    // create "uv-coordinates" with centered origin
+    float2 uv = id.xy / Resolution.xy *2 -1;
+
+    // create Ray from Canera to uv-coordinate
+    Ray ray = CreateCameraRay(uv);
+
+    Result[id.xy] = float4(backgroundColor, 1);
+
+    while(globalDistance <= maxDistance && steps < maxSteps){
+        steps++;
+        float4 evalSceneForPoint = minDst(ray.origin)[0];
+        float4 material = minDst(ray.origin)[1];
+
+        float dist = evalSceneForPoint.w;
+
+        // check if collision occured
+        if(dist < epsilon){
+
+            // set color at point
+            globalDistance += dist;
+
+            float3 hitPoint = ray.origin + ray.direction*dist;
+
+            float3 pointNormal = approximateNormal(hitPoint - ray.direction * epsilon);
+
+            float3 pColor = evalSceneForPoint.xyz;
+
+            float3 color = phongLight(hitPoint, pointNormal, pColor, material.x, material.y, material.z);
+
+            Result[id.xy] = float4(color, 1);
+            break;
+        }
+
+        // update new point position
+        ray.origin += ray.direction * dist;
+
+        // update current distance
+        globalDistance += dist;
+    }
+}
